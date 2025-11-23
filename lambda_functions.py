@@ -46,17 +46,20 @@ def _handle_message(cfg: config.RuntimeConfig, message: gmail_client.GmailMessag
         logger.warning("Unable to determine alias for message", extra={"gmail_uid": message.uid})
         return False
 
+    # Only process emails tied to active aliases
     alias_record = dynamodb.get_item(cfg.aliases_table, {"alias_id": alias_id})
     if not alias_record or alias_record.get("status") == "DISABLED":
         logger.info("Alias missing or disabled; skipping", extra={"alias_id": alias_id, "gmail_uid": message.uid})
         return False
 
+    # Idempotency – ignore already-ingested Gmail UIDs/message-ids
     message_id = _sanitize_message_id(email_obj.get("Message-ID")) or f"gmail-{message.uid}"
     existing = dynamodb.get_item(cfg.emails_table, {"message_id": message_id})
     if existing:
         logger.info("Duplicate message detected", extra={"message_id": message_id})
         return False
 
+    # Persist the raw MIME blob to S3 for downstream processing
     received_at = _parse_received_timestamp(email_obj)
     key = _build_s3_key(alias_id, received_at, message_id)
 
@@ -67,6 +70,7 @@ def _handle_message(cfg: config.RuntimeConfig, message: gmail_client.GmailMessag
     }
     s3_utils.put_raw_email(cfg.raw_email_bucket, key, message.raw_email, metadata)
 
+    # Record bookkeeping in DynamoDB (state, TTL, Telegram owner, S3 pointer)
     ttl_expiry = int(received_at.timestamp()) + EMAIL_TTL_SECONDS
     dynamodb.upsert_item(
         cfg.emails_table,
