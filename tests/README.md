@@ -19,22 +19,19 @@ Problem Specs:
 
 We use three levels of tests:
 
-1. **Unit tests**
+- **Unit tests**
+  - Test one small piece of code at a time.
+  - No real network calls.
+  - Example: “HTML parser extracts text correctly from a simple email.”
 
-   - Test one small piece of code at a time.
-   - No real network calls.
-   - Example: “HTML parser extracts text correctly from a simple email.”
+- **Integration tests**
+  - Test components working together.
+  - May use mocked AWS services (via [moto](https://github.com/getmoto/moto)).
+  - Example: “Lambda #1 writes to S3 and Lambda #2 can read that S3 object.”
 
-2. **Integration tests**
-
-   - Test components working together.
-   - May use mocked AWS services (via [moto](https://github.com/getmoto/moto)).
-   - Example: “Lambda #1 writes to S3 and Lambda #2 can read that S3 object.”
-
-3. **End-to-end (E2E) tests**
-
-   - Test the whole flow, as a real user would use it.
-   - Example: “User runs `/register`, sends an email, receives a summary in Telegram within 2 minutes.”
+- **End-to-end (E2E) tests**
+  - Test the whole flow, as a real user would use it.
+  - Example: “User runs `/register`, sends an email, receives a summary in Telegram within 2 minutes.”
 
 ---
 
