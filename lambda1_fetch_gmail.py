@@ -16,7 +16,7 @@ def lambda_handler(event, context):
     gmail_pass = os.environ['Secr3t!!']
 
     # S3 bucket name where emails will be saved
-    bucket_name = os.environ['Sample_Bucket']
+    bucket_name = os.environ['emails-received-and-stored'] # need to make sure this is the name of the bucket to be created in the final
 
     # Connect to Gmail securely using IMAP
     mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -63,3 +63,4 @@ def lambda_handler(event, context):
         "statusCode": 200,
         "body": f"Fetched and stored {len(email_ids)} emails."
     }
+
