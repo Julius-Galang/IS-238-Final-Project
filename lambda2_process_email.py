@@ -80,11 +80,11 @@ def lambda_handler(event, context):
     )
 
     # Message body to send to Telegram
-    message_text = f"📨 *New Email Summary*\n\n" \
+    message_text = f"*New Email Summary*\n\n" \
                    f"*Subject:* {subject}\n\n" \
                    f"*Summary:*\n{summary}\n\n" \
-                   f"📥 [Download Raw Email]({presigned_url})\n\n" \
-                   f"❌ Click below to deactivate this email address."
+                   f"[Download Raw Email]({presigned_url})\n\n" \
+                   f"Click below to deactivate this email address."
 
     # Inline button to deactivate email address
     keyboard = {
@@ -109,3 +109,4 @@ def lambda_handler(event, context):
     )
 
     return {"statusCode": 200, "body": "Email processed"}
+
