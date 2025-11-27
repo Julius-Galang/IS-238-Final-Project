@@ -3,6 +3,7 @@ import email
 import boto3                 
 import os                    
 from datetime import datetime  
+import json
 
 # Create S3 client to upload email files
 s3 = boto3.client('s3')
@@ -10,13 +11,13 @@ s3 = boto3.client('s3')
 def lambda_handler(event, context):
 
     # Read Gmail username from environment variables (NOT hard-coded)
-    gmail_user = os.environ['kilvenmarkbadiang11@gmail.com']
+    gmail_user = os.environ['email_user_name']  # actual email to be saved in AWS Lambda
 
     # Read Gmail App Password from environment variables
-    gmail_pass = os.environ['Secr3t!!']
+    gmail_pass = os.environ['email_password']   # actual email to be saved in AWS Lambda
 
     # S3 bucket name where emails will be saved
-    bucket_name = os.environ['emails-received-and-stored'] # need to make sure this is the name of the bucket to be created in the final
+    bucket_name = os.environ['s3_for_email'] # actual name of S3 Bucket to be saved in AWS Lambda
 
     # Connect to Gmail securely using IMAP
     mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -41,9 +42,10 @@ def lambda_handler(event, context):
 
         # Extract raw email content
         raw_email = msg_data[0][1]
+        json_email = json.dumps(raw_email.decode('utf-8'))
 
         # Create a timestamped filename for S3 (example: email_20250101_123000.eml)
-        filename = f"email_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{e_id.decode()}.eml"
+        filename = f"email_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{e_id.decode()}.json"
 
         # Upload raw email to S3
         s3.put_object(
@@ -64,3 +66,5 @@ def lambda_handler(event, context):
         "body": f"Fetched and stored {len(email_ids)} emails."
     }
 
+# The entire lambda functions should be triggered every minute using Amazon EventBridge
+# The S3 Bucket should have a lifecyle policy 
