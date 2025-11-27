@@ -42,7 +42,7 @@ def lambda_handler(event, context):
 
         # Extract raw email content
         raw_email = msg_data[0][1]
-        json_email = json.dumps(raw_email.decode('utf-8'))
+        json_email = json.dumps(raw_email.decode('utf-8'))  # still lacks html parser
 
         # Create a timestamped filename for S3 (example: email_20250101_123000.eml)
         filename = f"email_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{e_id.decode()}.json"
@@ -68,3 +68,4 @@ def lambda_handler(event, context):
 
 # The entire lambda functions should be triggered every minute using Amazon EventBridge
 # The S3 Bucket should have a lifecyle policy 
+
