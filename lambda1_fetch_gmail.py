@@ -43,57 +43,15 @@ def lambda_handler(event, context):
 
         # Extract raw email content
         raw_email = msg_data[0][1]
-
-        # Parse the email
-        msg = email.message_from_bytes(raw_email)
-
-        # Extract subject and body
-        subject = msg['Subject']
-
-        if msg.is_multipart():
-            for part in msg.walk():
-                ctype = part.get_content_type()
-                cdisposition = str(part.get('Content-Disposition'))
-
-                if ctype == "text/plain":
-                    plain_body = part.get_payload(decode=True).decode()
-                    plain_body = plain_body.replace("\r", "").strip()
-                
-                elif ctype == "text/html":
-                    html_body = part.get_payload(decode=True).decode()
-                    soup = BeautifulSoup(html_body, "html.parser")
-                    phtml_body = soup.get_text(separator="\n")
-                    phtml_body = phtml_body.replace("\r", "").strip()
-
-        else:
-            plain_body = msg.get_payload(decode=True).decode()
-            plain_body = plain_body.replace("\r", "").strip()
-
-        # convert to json
-
-        if plain_body == phtml_body:
-            to_json = {
-                "subject": subject,
-                "plain_body": plain_body,
-            }
         
-        else:
-            to_json = {
-                "subject": subject,
-                "plain_body": plain_body,
-                "html_body": phtml_body
-            }
-
-        json_email = json.dumps(to_json)
-
         # Create a timestamped filename for S3 (example: email_20250101_123000.json)
-        filename = f"email_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{e_id.decode()}.json"
+        filename = f"email_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{e_id.decode()}.eml"
 
         # Upload raw email to S3
         s3.put_object(
             Bucket=bucket_name,
             Key=filename,
-            Body=json_email
+            Body=raw_email
         )
 
     # Close inbox
@@ -112,3 +70,4 @@ def lambda_handler(event, context):
 # The entire lambda functions should be triggered every minute using Amazon EventBridge
 # The S3 Bucket should have a lifecyle policy
 # BeautifulSoup should be added as layer 
+
