@@ -3,7 +3,6 @@ import email
 import boto3                 
 import os                    
 from datetime import datetime
-from bs4 import BeautifulSoup  
 import json
 
 # Create S3 client to upload email files
@@ -69,5 +68,6 @@ def lambda_handler(event, context):
 # To be updated with actual gmail to be used
 # The entire lambda functions should be triggered every minute using Amazon EventBridge
 # The S3 Bucket should have a lifecyle policy
-# BeautifulSoup should be added as layer 
+# Last thing to do it error notifications using SNS
+
 
