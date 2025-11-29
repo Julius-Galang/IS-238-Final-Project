@@ -340,40 +340,40 @@ c. Root `README.md`
 ## References
 
 
-Amazon Web Services. (n.d.-a). *Biulding and testing Python* [Documentation]. GitHub Docs. https://docs.github.com/actions/guides/building-and-testing-python
+GitHub. (2025). *Biulding and testing Python* [Documentation]. GitHub Docs. https://docs.github.com/actions/guides/building-and-testing-python
 
-Amazon Web Services. (n.d.-b). *Download and upload objects using presigned URLs* [Documentation]. AWS Amazon Simple Storage Service User Guide. https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html
+Amazon Web Services. (2025). *Download and upload objects using presigned URLs* [Documentation]. AWS Amazon Simple Storage Service User Guide. https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html
 
-Amazon Web Services. (n.d.-c). *Sharing objects with presigned URLs* [Documentation]. AWS Amazon Simple Storage Service User Guide. https://docs.aws.amazon.com/AmazonS3/latest/userguide/ShareObjectPreSignedURL.html
+Amazon Web Services. (2025). *Sharing objects with presigned URLs* [Documentation]. AWS Amazon Simple Storage Service User Guide. https://docs.aws.amazon.com/AmazonS3/latest/userguide/ShareObjectPreSignedURL.html
 
-Amazon Web Services. (n.d.-d). *Managing the Lifecycle of objects* [Documentation]. AWS Amazon Simple Storage Service User Guide. https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html
+Amazon Web Services. (2025). *Managing the Lifecycle of objects* [Documentation]. AWS Amazon Simple Storage Service User Guide. https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html
 
-Amazon Web Services. (n.d.-e). *Security best practices in IAM* [Documentation]. AWS Identity and Access Management User Guide. https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html
+Amazon Web Services. (2025). *Security best practices in IAM* [Documentation]. AWS Identity and Access Management User Guide. https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html
 
-Amazon Web Services. (n.d.-f). *Prepare for least-privilege permissions* [Documentation]. AWS Identity and Access Management User Guide. https://docs.aws.amazon.com/IAM/latest/UserGuide/getting-started-reduce-permissions.html
+Amazon Web Services. (2025). *Prepare for least-privilege permissions* [Documentation]. AWS Identity and Access Management User Guide. https://docs.aws.amazon.com/IAM/latest/UserGuide/getting-started-reduce-permissions.html
 
-Amazon Web Services. (2021). *Techniques for writing least-privilege IAM policies* [Blog post]. AWS Security Blog. https://aws.amazon.com/blogs/security/techniques-for-writing-least-privilege-iam-policies/
+Amazon Web Services. (2020). *Techniques for writing least-privilege IAM policies* [Blog post]. AWS Security Blog. https://aws.amazon.com/blogs/security/techniques-for-writing-least-privilege-iam-policies/
 
-Amazon Web Services. (n.d.-g). *Why does the presigned URL for my Amazon S3 bucket expire before the expiration time that I specified?* [Knowledge center article]. AWS re:Post. https://repost.aws/knowledge-center/presigned-url-s3-bucket-expiration
+Amazon Web Services. (2023(. *Why does the presigned URL for my Amazon S3 bucket expire before the expiration time that I specified?* [Knowledge center article]. AWS re:Post. https://repost.aws/knowledge-center/presigned-url-s3-bucket-expiration
 
-Cloudflare, Inc. (n.d.-a). *Cloudflare Email Routing* [Documentation]. Cloudflare Developers. https://developers.cloudflare.com/email-routing/
+Cloudflare, Inc. (2025). *Cloudflare Email Routing* [Documentation]. Cloudflare Developers. https://developers.cloudflare.com/email-routing/
 
-Cloudflare, Inc. (n.d.-b). *Configure rules and addresses* [Documentation]. Cloudflare Developers. https://developers.cloudflare.com/email-routing/setup/email-routing-addresses/
+Cloudflare, Inc. (2025). *Configure rules and addresses* [Documentation]. Cloudflare Developers. https://developers.cloudflare.com/email-routing/setup/email-routing-addresses/
 
-pytest-dev. (n.d.-a). *pytest: helps you write better programs* [Documentation]. pytest. https://docs.pytest.org/
+pytest-dev. (2015). *pytest: helps you write better programs* [Documentation]. pytest. https://docs.pytest.org/
 
-pytest-dev. (n.d.-b). *pytest* [Repository]. GitHub. https://github.com/pytest-dev/pytest
+pytest-dev. (2025). *pytest* [Repository]. GitHub. https://github.com/pytest-dev/pytest
 
-Schlusser, M. et al. (n.d.). *Moto: Mock AWS services* [Documentation]. Moto. https://docs.getmoto.org/
+Schlusser, M. et al. (2015). *Moto: Mock AWS services* [Documentation]. Moto. https://docs.getmoto.org/
 
 Moto maintainers. (n.d.). *moto* [Repository]. GitHub. https://github.com/getmoto/moto
 
-Amazon Web Services. (2019). *Unit testing AWS Lambda with Python and mock AWS services* [Blog post]. AWS DevOps Blog. https://aws.amazon.com/blogs/devops/unit-testing-aws-lambda-with-python-and-mock-aws-services/
+Amazon Web Services. (2023). *Unit testing AWS Lambda with Python and mock AWS services* [Blog post]. AWS DevOps Blog. https://aws.amazon.com/blogs/devops/unit-testing-aws-lambda-with-python-and-mock-aws-services/
 
 Stack Exchange, Inc. (2022). *AWS presigned URL valid for more than 7 days* [Question and answers]. Stack Overflow. https://stackoverflow.com/questions/73493060/aws-presigned-url-valid-for-more-than-7-days
 
-Telegram Messenger LLP. (n.d.-a). *Telegram Bot API* [Documentation]. Telegram Core. https://core.telegram.org/bots/api
+Telegram Messenger LLP. (2025). *Telegram Bot API* [Documentation]. Telegram Core. https://core.telegram.org/bots/api
 
-Telegram Messenger LLP. (n.d.-b). *Telegram APIs for developers* [Overview]. Telegram Core. https://core.telegram.org/
+Telegram Messenger LLP. (2025). *Telegram APIs for developers* [Overview]. Telegram Core. https://core.telegram.org/
 
-Python Telegram Bot contributors. (n.d.). *python-telegram-bot documentation* [Documentation]. https://docs.python-telegram-bot.org/
+Python Telegram Bot contributors. (2025). *python-telegram-bot documentation* [Documentation]. https://docs.python-telegram-bot.org/
