@@ -15,7 +15,7 @@ import datetime as dt
 from email.message import EmailMessage
 
 ROOT_DOR = pathlib.Path(__file__).resolve().parents[2]
-sys.path.nsert(0, str(ROOT_DIR))
+sys.path.insert(0, str(ROOT_DIR))
 
 # --- Make fake "shared" package so lambda_functions can import it ---
 shared_module = types.ModuleType("shared")
