@@ -9,7 +9,7 @@ sys.path.insert(0, str(ROOT_DIR))
 fake_shared = types.ModuleType("shared")
 fake_shared.config = types.SimpleNamespace()
 fake_shared.dynamodb = types.SimpleNamespace()
-fake_shared.gmail_client = tpes.SimpleNamespace()
+fake_shared.gmail_client = types.SimpleNamespace()
 fake_shared.s3.utils = types.SimpleNamespace()
 sys.modules["shared"] = fake_shared
 
