@@ -1,7 +1,6 @@
 import os
 import pytest
 import boto3
-from moto import mock_s3
 
 # NOTE:
 #
@@ -22,7 +21,6 @@ pytestmark = pytest.mark.skip(
 )
 
 
-@mock_s3
 def test_lambda1_writes_email_to_s3():
     """
     Lambda #1 should write raw email into configured S3 bucket.
