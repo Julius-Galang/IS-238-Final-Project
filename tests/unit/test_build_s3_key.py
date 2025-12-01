@@ -1,10 +1,17 @@
 import datetime as dt
 import pathlib
 import sys
+import types
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parents[2]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+sys.path.insert(0, str(ROOT_DIR))
+
+fake_shared = types.ModuleType("shared")
+fake_shared.config = types.SimpleNamespace()
+fake_shraed.dynamodb = types.SimpleNamespace()
+fake_shared.gmail_client = tpes.SimpleNamespace()
+fake_shared.s3.utils = types.SimpleNamespace()
+sys.modules["shared"] = fake_shared
 
 from lambda_functions import _build_s3_key
 
