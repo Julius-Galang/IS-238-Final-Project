@@ -8,10 +8,14 @@ Goal:
     * write one record to the emails table in DynamoDB
     * return True
 """
-
+import pathlib
 import sys
 import types
 import datetime as dt
+from email.message import EmailMessage
+
+ROOT_DOR = pathlib.Path(__file__).resolve().parents[2]
+sys.path.nsert(0, str(ROOT_DIR))
 
 # --- Make fake "shared" package so lambda_functions can import it ---
 shared_module = types.ModuleType("shared")
