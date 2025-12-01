@@ -10,7 +10,7 @@ fake_shared = types.ModuleType("shared")
 fake_shared.config = types.SimpleNamespace()
 fake_shared.dynamodb = types.SimpleNamespace()
 fake_shared.gmail_client = types.SimpleNamespace()
-fake_shared.s3.utils = types.SimpleNamespace()
+fake_shared.s3_utils = types.SimpleNamespace()
 sys.modules["shared"] = fake_shared
 
 from lambda_functions import _build_s3_key
