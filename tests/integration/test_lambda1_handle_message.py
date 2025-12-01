@@ -140,6 +140,6 @@ def test_handle_message_stores_email_for_active_alias():
     assert email_record["alias_id"] == alias_id
     assert email_record["state"] == "PENDING"
 
-    # TTL should be in the future (rough sanity check)
-    now_utc = dt.datetime.now(dt.timezone.utc).timestamp()
-    assert email_record["ttl_expiry"] > now_utc
+    # TTL should be in the future
+    received_at = dt.datetime.fromisoformat(email_record["received_at"])
+    assert email_record["ttl_expiry"] > received_at.timestamp()
