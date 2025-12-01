@@ -33,7 +33,7 @@ def test_sanitize_message_id_keeps_alnum_dash_underscore_only():
     raw = "<ID: A B_C-1.2@host.example>"
     result = _sanitize_message_id(raw)
     # allowed: letters, digits, -, _
-    assert result == "IDABC-12hostexample"
+    assert result == "IDAB_C-12hostexample"
 
 
 def test_sanitize_message_id_returns_none_if_everything_is_removed():
