@@ -143,3 +143,37 @@ def test_handle_message_stores_email_for_active_alias():
     # TTL should be in the future
     received_at = dt.datetime.fromisoformat(email_record["received_at"])
     assert email_record["ttl_expiry"] > received_at.timestamp()
+
+def test_handle_message_skips_disabled_alias():
+    # Arrange: wire fake helpers into lambda_functions
+    fake_dynamo = FakeDynamoDB()
+    fake_s3 = FakeS3Utils()
+
+    lambda_functions.dynamodb = fake_dynamo
+    lambda_functions.s3_utils = fake_s3
+
+    cfg = FakeConfig()
+    alias_id = "testalias123"
+    alias_address = f"{alias_id}@example.com"
+
+    # Mark this alias ACTIVE in the fake aliases table
+    fake_dynamo.alias_table[alias_id] = {
+        "status": "DISABLED",
+        "telegram_chat_id": 999999,
+    }
+
+    # Build fake Gmail message for this alias
+    raw_email = _make_sample_email(alias_address)
+    message = FakeGmailMessage(uid="GMAIL-UID-1", raw_email=raw_email)
+
+    # Act: call the Lambda 1 core handler
+    result = lambda_functions._handle_message(cfg, message)
+
+    # Assert: handler reports success
+    assert result is False
+
+    # No object should have been "written"to S3
+    assert fake_s3.put_calls == []
+
+    # No email record should exist in the fake emails table
+    assert fake_dynamo.email_table == {}
