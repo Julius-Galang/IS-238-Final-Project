@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import datetime as dt
 import email
+import json
 import logging
 import os
+import urllib.request
+import urllib.error
 from typing import Any
-
-import requests
 
 from shared import config, dynamodb, s3_utils, telegram
 
