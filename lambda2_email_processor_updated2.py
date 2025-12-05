@@ -11,7 +11,7 @@ import time
 from typing import Any
 
 import boto3
-import requests
+import requests  # REQUIRED for OpenAI
 
 from shared import config, dynamodb, s3_utils, telegram
 
@@ -20,7 +20,7 @@ logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    """Process S3 emails and send to Telegram."""
+    """Process S3 emails and send summarized versions to Telegram."""
     cfg = config.get_config()
     
     # Get current bot info
@@ -35,11 +35,11 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         current_bot_username = "unknown"
         bot_info = {"id": current_bot_id, "username": current_bot_username}
     
-    logger.info(f"Processing with bot: @{current_bot_username} (ID: {current_bot_id})")
+    logger.info(f"📧 Processing emails with bot: @{current_bot_username}")
     
-    processed = []
-    migrated = []
-    failed = []
+    processed = 0
+    failed = 0
+    migrated = 0
     
     for record in event.get("Records", []):
         if record.get("eventSource") == "aws:s3":
@@ -47,65 +47,76 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             key = record["s3"]["object"]["key"]
             
             try:
-                result = _process_s3_email(cfg, bucket, key, bot_info)
+                result = _process_email(cfg, bucket, key, bot_info)
                 
-                if result["status"] == "processed":
-                    processed.append(result["message_id"])
-                elif result["status"] == "migrated":
-                    migrated.append(result["message_id"])
-                elif result["status"] == "failed":
-                    failed.append(result["message_id"])
+                if result == "processed":
+                    processed += 1
+                elif result == "migrated":
+                    migrated += 1
+                elif result == "failed":
+                    failed += 1
                     
             except Exception as exc:
                 logger.exception(f"Failed to process {key}", extra={"error": str(exc)})
-                failed.append(key)
+                failed += 1
+    
+    logger.info(f"✅ Complete: {processed} processed, {migrated} migrated, {failed} failed")
     
     return {
         "statusCode": 200,
         "body": json.dumps({
-            "processed": len(processed),
-            "migrated": len(migrated),
-            "failed": len(failed),
+            "processed": processed,
+            "migrated": migrated,
+            "failed": failed,
             "bot": current_bot_username,
-            "details": {
-                "processed": processed[:10],  # Limit output
-                "migrated": migrated[:10],
-                "failed": failed[:10]
-            }
+            "timestamp": dt.datetime.now(dt.timezone.utc).isoformat()
         })
     }
 
 
-def _process_s3_email(
+def _process_email(
     cfg: config.RuntimeConfig, 
     bucket: str, 
     key: str, 
     current_bot_info: dict
-) -> dict:
-    """Process a single S3 email file."""
-    # Parse S3 key to get message_id
-    message_id = _extract_message_id_from_key(key)
-    if not message_id:
-        return {"status": "failed", "message_id": key, "reason": "invalid_key"}
+) -> str:
+    """Process a single email from S3."""
+    # Extract message_id from S3 key
+    # Format: alias_id/YYYY/MM/DD/message_id-uuid.eml
+    parts = key.split("/")
+    if len(parts) < 4:
+        logger.error(f"Invalid S3 key format: {key}")
+        return "failed"
     
-    logger.info(f"Processing email: {message_id} from {key}")
+    filename = parts[-1]  # message_id-uuid.eml
+    if not filename.endswith(".eml"):
+        logger.error(f"Not an .eml file: {filename}")
+        return "failed"
+    
+    # Remove .eml extension to get message_id
+    message_id = filename[:-4]  # message_id-uuid
+    
+    logger.info(f"📨 Processing email: {message_id}")
     
     # Get email record from DynamoDB
     email_record = dynamodb.get_item(cfg.emails_table, {"message_id": message_id})
+    
+    # If not found, try alternative format (just the message_id part before dash)
+    if not email_record and "-" in message_id:
+        alt_message_id = message_id.split("-")[0]
+        email_record = dynamodb.get_item(cfg.emails_table, {"message_id": alt_message_id})
+        if email_record:
+            logger.info(f"Found email with alternative ID: {alt_message_id}")
+            message_id = alt_message_id
+    
     if not email_record:
-        # Try alternative message_id format
-        alt_message_id = _try_alternative_message_id(key)
-        if alt_message_id:
-            email_record = dynamodb.get_item(cfg.emails_table, {"message_id": alt_message_id})
-        
-        if not email_record:
-            logger.error(f"No email record found for {message_id}")
-            return {"status": "failed", "message_id": message_id, "reason": "not_found"}
+        logger.error(f"❌ No DynamoDB record found for {message_id}")
+        return "failed"
     
     # Check if already processed
     if email_record.get("state") == "PROCESSED":
-        logger.info(f"Email already processed: {message_id}")
-        return {"status": "skipped", "message_id": message_id}
+        logger.info(f"⏭️ Already processed: {message_id}")
+        return "skipped"
     
     # Handle bot migration if needed
     email_bot_id = email_record.get("telegram_bot_id")
@@ -113,25 +124,26 @@ def _process_s3_email(
     needs_migration = email_record.get("needs_migration", False)
     
     if needs_migration or (email_bot_id and email_bot_id != current_bot_id):
-        # Try to migrate email to current bot
-        migrated = _migrate_email_to_current_bot(cfg, email_record, current_bot_info)
-        if not migrated:
-            logger.warning(f"Email {message_id} needs migration but user hasn't migrated yet")
-            return {"status": "queued", "message_id": message_id, "reason": "needs_migration"}
+        logger.info(f"🔄 Email {message_id} needs bot migration")
+        migration_result = _handle_bot_migration(cfg, email_record, current_bot_info)
         
-        # Refresh email record after migration
-        email_record = dynamodb.get_item(cfg.emails_table, {"message_id": message_id})
+        if migration_result == "migrated":
+            # Refresh email record after migration
+            email_record = dynamodb.get_item(cfg.emails_table, {"message_id": message_id})
+            logger.info(f"✅ Successfully migrated email {message_id}")
+        elif migration_result == "queued":
+            logger.info(f"⏳ Email queued for migration: {message_id}")
+            return "queued"
+        else:
+            logger.error(f"❌ Migration failed for {message_id}")
+            return "failed"
     
-    # Process the email
+    # Now process the email content
     return _process_email_content(cfg, bucket, key, email_record)
 
 
-def _migrate_email_to_current_bot(
-    cfg: config.RuntimeConfig, 
-    email_record: dict, 
-    current_bot_info: dict
-) -> bool:
-    """Migrate email to use current bot."""
+def _handle_bot_migration(cfg, email_record, current_bot_info):
+    """Handle migration of email to current bot."""
     message_id = email_record.get("message_id")
     alias_id = email_record.get("alias_id")
     
@@ -139,12 +151,12 @@ def _migrate_email_to_current_bot(
     alias_record = dynamodb.get_item(cfg.aliases_table, {"alias_id": alias_id})
     if not alias_record:
         logger.error(f"No alias record for {alias_id}")
-        return False
+        return "failed"
     
-    # Check if alias has migrated to current bot
+    # Check if alias uses current bot
     alias_bot_id = alias_record.get("telegram_bot_id")
     if alias_bot_id == current_bot_info.get("id"):
-        # User has migrated! Update email record
+        # User has migrated to current bot
         new_chat_id = alias_record.get("telegram_chat_id")
         
         dynamodb.update_item(
@@ -154,57 +166,51 @@ def _migrate_email_to_current_bot(
                 SET telegram_chat_id = :chat_id,
                     telegram_bot_id = :bot_id,
                     telegram_bot_username = :bot_username,
-                    needs_migration = :no_migration,
+                    needs_migration = :false,
                     migrated_at = :now
             """,
             ExpressionAttributeValues={
                 ":chat_id": str(new_chat_id),
                 ":bot_id": current_bot_info.get("id"),
                 ":bot_username": current_bot_info.get("username", ""),
-                ":no_migration": False,
+                ":false": False,
                 ":now": dt.datetime.now(dt.timezone.utc).isoformat()
             }
         )
-        
-        logger.info(f"✅ Migrated email {message_id} to new bot")
-        return True
+        return "migrated"
     
-    return False
+    # User hasn't migrated yet
+    return "queued"
 
 
-def _process_email_content(
-    cfg: config.RuntimeConfig, 
-    bucket: str, 
-    key: str, 
-    email_record: dict
-) -> dict:
+def _process_email_content(cfg, bucket, key, email_record):
     """Process email content and send to Telegram."""
     message_id = email_record.get("message_id")
     telegram_chat_id = email_record.get("telegram_chat_id")
     alias_id = email_record.get("alias_id")
     
     if not telegram_chat_id:
-        logger.error(f"No telegram_chat_id for {message_id}")
-        return {"status": "failed", "message_id": message_id, "reason": "no_chat_id"}
+        logger.error(f"❌ No telegram_chat_id for {message_id}")
+        return "failed"
     
     try:
-        # Read email from S3
+        # 1. Read email from S3
         raw_bytes = s3_utils.get_raw_email(bucket, key)
         msg = email.message_from_bytes(raw_bytes)
         
-        # Extract subject and body
+        # 2. Extract email content
         subject = msg.get("Subject", "(no subject)")
         body_text = _extract_email_body(msg)
         
-        # Summarize with OpenAI
-        summary = _summarize_email(subject, body_text)
+        # 3. Summarize with OpenAI
+        summary = _summarize_with_openai(subject, body_text)
         
-        # Build download URL
+        # 4. Build download URL
         base_url = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
         download_url = f"{base_url}/email/{alias_id}/{message_id}" if base_url else None
         
-        # Send to Telegram
-        success = _send_telegram_message(
+        # 5. Send to Telegram
+        success = _send_to_telegram(
             cfg, telegram_chat_id, alias_id, subject, summary, download_url
         )
         
@@ -216,22 +222,24 @@ def _process_email_content(
                 UpdateExpression="""
                     SET #state = :state, 
                         processed_at = :ts,
-                        telegram_sent_at = :sent_ts
+                        telegram_sent_at = :sent_ts,
+                        summary = :summary
                 """,
                 ExpressionAttributeNames={"#state": "state"},
                 ExpressionAttributeValues={
                     ":state": "PROCESSED",
                     ":ts": dt.datetime.now(dt.timezone.utc).isoformat(),
-                    ":sent_ts": dt.datetime.now(dt.timezone.utc).isoformat()
+                    ":sent_ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    ":summary": summary[:500]  # Store truncated summary
                 }
             )
             
             logger.info(f"✅ Successfully sent email {message_id} to Telegram")
-            return {"status": "processed", "message_id": message_id}
+            return "processed"
         else:
             logger.error(f"❌ Failed to send email {message_id} to Telegram")
             
-            # Mark as failed after retries
+            # Mark as failed
             dynamodb.update_item(
                 cfg.emails_table,
                 {"message_id": message_id},
@@ -243,46 +251,11 @@ def _process_email_content(
                 }
             )
             
-            return {"status": "failed", "message_id": message_id, "reason": "telegram_failed"}
+            return "failed"
             
     except Exception as e:
-        logger.exception(f"Error processing email {message_id}: {e}")
-        return {"status": "failed", "message_id": message_id, "reason": str(e)}
-
-
-def _extract_message_id_from_key(key: str) -> str:
-    """Extract message_id from S3 key."""
-    # Key format: alias_id/YYYY/MM/DD/message_id-uuid.eml
-    parts = key.split("/")
-    if len(parts) < 4:
-        return ""
-    
-    filename = parts[-1]  # message_id-uuid.eml
-    if not filename.endswith(".eml"):
-        return ""
-    
-    # Remove .eml extension
-    filename_no_ext = filename[:-4]
-    
-    # Return full filename without extension as message_id
-    return filename_no_ext
-
-
-def _try_alternative_message_id(key: str) -> str:
-    """Try alternative message_id extraction."""
-    parts = key.split("/")
-    filename = parts[-1] if parts else ""
-    
-    if not filename.endswith(".eml"):
-        return ""
-    
-    filename_no_ext = filename[:-4]
-    
-    # Try splitting by dash and taking first part
-    if "-" in filename_no_ext:
-        return filename_no_ext.split("-")[0]
-    
-    return filename_no_ext
+        logger.exception(f"❌ Error processing email {message_id}: {e}")
+        return "failed"
 
 
 def _extract_email_body(msg: email.message.EmailMessage) -> str:
@@ -329,42 +302,65 @@ def _extract_email_body(msg: email.message.EmailMessage) -> str:
                             html = payload.decode(charset, errors="ignore")
                             # Simple HTML to text conversion
                             import re
+                            # Remove script/style tags
+                            html = re.sub(r'<(script|style).*?>.*?</\1>', '', html, flags=re.DOTALL)
+                            # Replace <br> with newlines
+                            html = re.sub(r'<br\s*/?>', '\n', html, flags=re.IGNORECASE)
+                            # Remove all remaining tags
                             body = re.sub(r'<[^>]+>', '', html)
                             body = re.sub(r'\n{3,}', '\n\n', body)
                             break
                     except:
                         pass
     
-    # Truncate if too long
-    if len(body) > 15000:
-        body = body[:15000] + "...\n[Email truncated]"
+    # Clean up
+    body = body.strip()
     
-    return body.strip()
+    # Truncate if too long for OpenAI
+    if len(body) > 12000:
+        body = body[:12000] + "...\n[Email truncated for summarization]"
+    
+    return body
 
 
-def _summarize_email(subject: str, body: str) -> str:
-    """Summarize email using OpenAI."""
+def _summarize_with_openai(subject: str, body: str) -> str:
+    """
+    Summarize email using OpenAI API.
+    
+    Returns: Summary if successful, fallback text if not.
+    """
+    # Check if OpenAI is configured
     api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key or not body.strip():
-        # Fallback: return truncated body
-        if len(body) > 1000:
-            return body[:1000] + "..."
-        return body
+    if not api_key:
+        logger.warning("⚠️ OPENAI_API_KEY not set, using fallback")
+        return _create_fallback_summary(subject, body)
+    
+    # Don't summarize very short emails
+    if len(body) < 100:
+        logger.info("Email too short for summarization")
+        return f"Short email: {body}"
     
     # Prepare prompt
-    prompt = f"""Please summarize this email in 2-3 concise sentences:
+    prompt = f"""Please summarize this email in 2-3 concise sentences for a busy Telegram user.
 
-Subject: {subject}
+Email Subject: {subject}
 
-Email content:
-{body[:12000]}"""
+Email Content:
+{body}
+
+Provide a clear, concise summary focusing on:
+1. The main purpose of the email
+2. Any important details or actions needed
+3. Key takeaways
+
+Summary:"""
     
     payload = {
         "model": os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo"),
         "messages": [
             {
                 "role": "system", 
-                "content": "You are a helpful assistant that summarizes emails concisely. Focus on key points and actions needed."
+                "content": "You are a helpful assistant that creates concise, clear email summaries."
             },
             {"role": "user", "content": prompt}
         ],
@@ -373,6 +369,8 @@ Email content:
     }
     
     try:
+        logger.info(f"🤖 Calling OpenAI API for summarization (body length: {len(body)} chars)")
+        
         response = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={
@@ -380,7 +378,7 @@ Email content:
                 "Content-Type": "application/json"
             },
             json=payload,
-            timeout=30
+            timeout=30  # 30 second timeout
         )
         
         if response.status_code == 200:
@@ -388,23 +386,57 @@ Email content:
             summary = data["choices"][0]["message"]["content"].strip()
             
             # Validate summary
-            if summary and len(summary) > 10:
+            if summary and len(summary) > 20:
+                logger.info(f"✅ OpenAI summary successful ({len(summary)} chars)")
                 return summary
+            else:
+                logger.warning("OpenAI returned empty summary")
+                return _create_fallback_summary(subject, body)
         
-        logger.warning(f"OpenAI returned non-200: {response.status_code}")
-        
+        else:
+            logger.error(f"❌ OpenAI API error: {response.status_code} - {response.text}")
+            return _create_fallback_summary(subject, body)
+            
     except requests.exceptions.Timeout:
-        logger.warning("OpenAI request timed out")
+        logger.warning("⏱️ OpenAI request timed out")
+        return _create_fallback_summary(subject, body)
     except Exception as e:
-        logger.error(f"OpenAI error: {e}")
+        logger.error(f"❌ OpenAI error: {e}")
+        return _create_fallback_summary(subject, body)
+
+
+def _create_fallback_summary(subject: str, body: str) -> str:
+    """Create a fallback summary when OpenAI is unavailable."""
+    # Simple truncation for short emails
+    if len(body) <= 500:
+        return body
     
-    # Fallback: return truncated body
-    if len(body) > 1000:
-        return body[:1000] + "..."
-    return body
+    # Try to extract first few sentences
+    import re
+    
+    # Split into sentences
+    sentences = re.split(r'[.!?]+', body)
+    
+    # Take first 3-5 sentences
+    summary_sentences = []
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if sentence and len(sentence) > 10:
+            summary_sentences.append(sentence)
+            if len(summary_sentences) >= 5 or len(' '.join(summary_sentences)) > 400:
+                break
+    
+    if summary_sentences:
+        summary = ' '.join(summary_sentences)
+        if len(summary) > 500:
+            summary = summary[:500] + "..."
+        return summary
+    
+    # Fallback: just truncate
+    return body[:500] + "..."
 
 
-def _send_telegram_message(
+def _send_to_telegram(
     cfg: config.RuntimeConfig,
     telegram_chat_id: str,
     alias_id: str,
@@ -413,12 +445,12 @@ def _send_telegram_message(
     download_url: str | None,
     max_retries: int = 3
 ) -> bool:
-    """Send message to Telegram with retry logic."""
+    """Send summarized email to Telegram."""
     try:
         token = telegram.get_bot_token(cfg.telegram_secret_arn)
         chat_id = int(telegram_chat_id)
         
-        # Build message
+        # Build the Telegram message
         message_lines = [
             "📧 *New Email Summary*",
             "",
@@ -433,16 +465,16 @@ def _send_telegram_message(
         
         message_text = "\n".join(message_lines)
         
-        # Check length limit (Telegram max: 4096 chars)
+        # Telegram has 4096 character limit
         if len(message_text) > 4000:
-            # Truncate summary
-            available = 4000 - len("\n".join(message_lines[:5])) - 50
-            if available > 100:
-                summary = summary[:available] + "..."
+            # Truncate the summary
+            available_chars = 4000 - len("\n".join(message_lines[:5])) - 100
+            if available_chars > 100:
+                summary = summary[:available_chars] + "..."
                 message_lines[4] = summary
                 message_text = "\n".join(message_lines)
             else:
-                # Very long subject, truncate it
+                # Even subject is too long
                 subject = subject[:100] + "..."
                 message_lines[2] = f"*Subject:* {subject}"
                 message_text = "\n".join(message_lines)[:4000]
@@ -451,16 +483,16 @@ def _send_telegram_message(
         keyboard = {
             "inline_keyboard": [[
                 {
-                    "text": "🚫 Disable this address",
+                    "text": "🚫 Disable this email address",
                     "callback_data": f"disable:{alias_id}"
                 }
             ]]
         }
         
-        # Send with retry
+        # Send with retry logic
         for attempt in range(max_retries):
             try:
-                logger.info(f"Sending to Telegram (attempt {attempt + 1}/{max_retries})")
+                logger.info(f"📤 Sending to Telegram (attempt {attempt + 1}/{max_retries})")
                 
                 success = telegram.send_message(
                     token=token,
@@ -471,26 +503,27 @@ def _send_telegram_message(
                 )
                 
                 if success:
-                    logger.info(f"✅ Telegram message sent to {chat_id}")
+                    logger.info(f"✅ Telegram message sent successfully to chat {chat_id}")
                     return True
                 else:
-                    logger.warning(f"Telegram send failed (attempt {attempt + 1})")
+                    logger.warning(f"⚠️ Telegram send failed (attempt {attempt + 1})")
                     
                     if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt  # 1, 2, 4 seconds
+                        wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4 seconds
+                        logger.info(f"⏱️ Waiting {wait_time}s before retry...")
                         time.sleep(wait_time)
                         
             except Exception as e:
-                logger.error(f"Telegram attempt {attempt + 1} error: {e}")
+                logger.error(f"❌ Telegram attempt {attempt + 1} error: {e}")
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)
         
-        logger.error(f"All Telegram attempts failed for chat {chat_id}")
+        logger.error(f"❌ All Telegram attempts failed for chat {chat_id}")
         return False
         
     except ValueError:
-        logger.error(f"Invalid chat_id (not a number): {telegram_chat_id}")
+        logger.error(f"❌ Invalid chat_id (not a number): {telegram_chat_id}")
         return False
     except Exception as e:
-        logger.exception(f"Telegram send error: {e}")
+        logger.exception(f"❌ Telegram send error: {e}")
         return False
