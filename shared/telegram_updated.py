@@ -67,17 +67,33 @@ def send_message(
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             body = resp.read().decode("utf-8")
-            if resp.status >= 400:
-                logger.error(
-                    "Telegram sendMessage failed",
-                    extra={"status": resp.status, "body": body},
-                )
+            
+            # DEBUG: Log the raw response
+            logger.info(f"Telegram raw response: {body[:200]}...")
+            
+            # Parse JSON response
+            try:
+                response_data = json.loads(body)
+            except json.JSONDecodeError:
+                logger.error(f"Telegram returned invalid JSON: {body}")
                 return False
-        return True
+            
+            # CRITICAL: Check Telegram's "ok" field
+            if not response_data.get("ok", False):
+                error_msg = response_data.get("description", "Unknown error")
+                error_code = response_data.get("error_code", "N/A")
+                logger.error(f"Telegram API error {error_code}: {error_msg}")
+                return False
+            
+            # SUCCESS!
+            logger.info(f"Telegram message sent successfully to chat_id {chat_id}")
+            return True
+            
     except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8") if hasattr(e, 'read') else str(e)
         logger.error(
             "Telegram sendMessage HTTPError",
-            extra={"code": e.code, "reason": e.reason},
+            extra={"code": e.code, "reason": e.reason, "body": error_body},
         )
     except urllib.error.URLError as e:
         logger.error(
@@ -91,3 +107,26 @@ def send_message(
         )
 
     return False
+
+
+def test_bot_token(token: str) -> bool:
+    """Test if bot token is valid."""
+    url = f"{TELEGRAM_API_BASE}/bot{token}/getMe"
+    
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8")
+            data = json.loads(body)
+            
+            if data.get("ok", False):
+                bot_info = data.get("result", {})
+                logger.info(f"Bot is valid: @{bot_info.get('username')} (ID: {bot_info.get('id')})")
+                return True
+            else:
+                logger.error(f"Bot token invalid: {data.get('description')}")
+                return False
+                
+    except Exception as e:
+        logger.error(f"Failed to test bot token: {e}")
+        return False
