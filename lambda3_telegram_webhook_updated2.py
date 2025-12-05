@@ -1,10 +1,11 @@
-"""Lambda entry point for Telegram webhook and email download redirects.
+"""
+Lambda #3: Telegram Bot Webhook Handler.
 
-This Lambda handles:
-- Telegram webhook messages (commands from users)
-- Bot migration when users switch to new bot
-- Email download redirects
-- User registration and alias management
+This Lambda:
+1. Serves as the Telegram webhook URL
+2. Handles commands from users (/start, /register, /list, /deactivate)
+3. Manages email alias creation and deactivation
+4. Provides email download redirects
 """
 
 from __future__ import annotations
@@ -13,665 +14,783 @@ import datetime as dt
 import json
 import logging
 import os
-import secrets as secrets_lib
-from typing import Any
-from urllib import request as urlrequest
-from urllib import parse
+import secrets
+import string
+from typing import Any, Dict, List, Optional
+from urllib import parse, request
 
 import boto3
-
-from shared import cloudflare, config, dynamodb, s3_utils, telegram
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
-# For the callback-query acknowledgement
+# Initialize AWS clients
+_secrets = boto3.client("secretsmanager")
+_dynamodb = boto3.resource("dynamodb")
+_s3 = boto3.client("s3")
+
+# Telegram API base URL
 TELEGRAM_API_BASE = "https://api.telegram.org"
 
-# Initialize DynamoDB resource
-_dynamodb = boto3.resource("dynamodb")
+# Email domain (configure via environment variable)
+EMAIL_DOMAIN = os.getenv("EMAIL_DOMAIN", "your-domain.com")
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """
-    Single Lambda entrypoint.
-
-    - POST /telegram/webhook    → Telegram updates (messages + callback buttons)
-    - GET  /email/{aliasId}/{messageId} → redirect to S3 pre-signed URL
+    Main Lambda handler for Telegram webhook and email downloads.
     """
-    cfg = config.get_config()
-
-    request_ctx = event.get("requestContext", {}).get("http", {}) or {}
-    path = request_ctx.get("path", "") or ""
-    method = (request_ctx.get("method") or "GET").upper()
-
-    # 1) Telegram webhook (JSON POST from Telegram)
+    # Parse request context
+    request_ctx = event.get("requestContext", {})
+    http_info = request_ctx.get("http", {})
+    
+    path = http_info.get("path", "")
+    method = http_info.get("method", "GET").upper()
+    
+    logger.debug(f"Request: {method} {path}")
+    
+    # 1) Telegram webhook (POST from Telegram)
     if path.endswith("/telegram/webhook") and method == "POST":
-        return _handle_telegram_update(cfg, event)
-
-    # 2) Download redirect (user clicks "Download email" link in Telegram)
+        return _handle_telegram_webhook(event)
+    
+    # 2) Email download redirect (GET from user)
     if path.startswith("/email/") and method == "GET":
-        return _handle_email_download(cfg, event)
-
+        return _handle_email_download(event)
+    
+    # 3) Health check (optional)
+    if path == "/health" and method == "GET":
+        return _handle_health_check()
+    
     # Anything else → 404
-    return {"statusCode": 404, "body": "Not Found"}
+    return {
+        "statusCode": 404,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({"error": "Not found"})
+    }
 
 
-def _handle_telegram_update(cfg: config.RuntimeConfig, event: dict[str, Any]) -> dict[str, Any]:
-    """Parse Telegram update payload and route to message vs callback logic."""
-    body = event.get("body") or "{}"
+def _handle_telegram_webhook(event: dict[str, Any]) -> dict[str, Any]:
+    """Handle Telegram webhook updates."""
+    body = event.get("body", "{}")
+    
     try:
         update = json.loads(body)
     except json.JSONDecodeError:
-        logger.warning("Telegram webhook payload is not valid JSON", extra={"body": body})
-        # Always return 200 so Telegram does not keep retrying
-        return {"statusCode": 200, "body": "ignored"}
-
-    # Get bot token from Secrets Manager
-    bot_token = telegram.get_bot_token(cfg.telegram_secret_arn)
-
+        logger.warning("Invalid JSON in webhook payload")
+        # Always return 200 to prevent Telegram from retrying
+        return {"statusCode": 200, "body": "ok"}
+    
+    # Get Telegram bot token
+    telegram_secret_arn = os.environ["TELEGRAM_SECRET_ARN"]
+    bot_token = _get_telegram_token(telegram_secret_arn)
+    
+    if not bot_token:
+        logger.error("Failed to get Telegram bot token")
+        return {"statusCode": 500, "body": "Internal server error"}
+    
+    # Route the update
     if "message" in update:
-        _handle_message(cfg, bot_token, update["message"])
+        _handle_telegram_message(bot_token, update["message"])
     elif "callback_query" in update:
-        _handle_callback_query(cfg, bot_token, update["callback_query"])
-
-    # Telegram only needs 200 OK
+        _handle_callback_query(bot_token, update["callback_query"])
+    
+    # Always return 200 OK to Telegram
     return {"statusCode": 200, "body": "ok"}
 
 
-def _handle_message(cfg: config.RuntimeConfig, token: str, message: dict[str, Any]) -> None:
-    """
-    Handle normal text messages with bot migration support.
-
-    Supported commands:
-      - /start           → Welcome + bot migration
-      - /list, /aliases  → Show current aliases
-      - /register, /newemail, /create → Create new alias
-      - /deactivate, /disable <alias> → Disable alias
-    """
-    chat = message.get("chat") or {}
+def _handle_telegram_message(bot_token: str, message: Dict[str, Any]) -> None:
+    """Handle incoming Telegram messages (commands)."""
+    chat = message.get("chat", {})
     chat_id = chat.get("id")
+    
     if not chat_id:
+        logger.warning("No chat ID in message")
         return
-
-    # Get current bot info
-    try:
-        bot_info = telegram.get_bot_info(token)
-        current_bot_id = bot_info.get("id")
-        current_bot_username = bot_info.get("username", "")
-    except Exception as e:
-        logger.error(f"Failed to get bot info: {e}")
-        current_bot_id = "unknown"
-        current_bot_username = "unknown"
-
-    # Ensure user record exists with current bot info
-    user_record = _ensure_user(cfg, chat_id, message, current_bot_id, current_bot_username)
-
-    text = (message.get("text") or "").strip()
-    lower = text.lower()
-
-    # ----- /start command (CRITICAL for bot migration) -----
-    if lower.startswith("/start"):
-        # Update user with current bot info (even if they already exist)
-        _update_user_with_bot_info(cfg, chat_id, current_bot_id, current_bot_username, message)
-        
-        # Migrate user's aliases to new bot
-        _migrate_user_aliases_to_bot(cfg, str(chat_id), current_bot_id, current_bot_username)
-        
-        # Send welcome message
-        telegram.send_message(
-            token,
+    
+    text = message.get("text", "").strip()
+    if not text:
+        return
+    
+    # Get user info
+    from_user = message.get("from", {})
+    username = from_user.get("username", "")
+    first_name = from_user.get("first_name", "")
+    
+    logger.info(f"📨 Message from {username} ({chat_id}): {text[:50]}...")
+    
+    # Convert to lowercase for command matching
+    lower_text = text.lower()
+    
+    # Handle commands
+    if lower_text.startswith("/start"):
+        _handle_start_command(bot_token, chat_id, username, first_name)
+    
+    elif lower_text.startswith("/help"):
+        _handle_help_command(bot_token, chat_id)
+    
+    elif lower_text.startswith("/list") or lower_text.startswith("/aliases"):
+        _handle_list_command(bot_token, chat_id)
+    
+    elif lower_text.startswith("/register") or lower_text.startswith("/newemail") or lower_text.startswith("/create"):
+        _handle_register_command(bot_token, chat_id)
+    
+    elif lower_text.startswith("/deactivate") or lower_text.startswith("/disable"):
+        _handle_deactivate_command(bot_token, chat_id, text)
+    
+    else:
+        # Unknown command
+        _send_telegram_message(
+            bot_token=bot_token,
             chat_id=chat_id,
             text=(
-                f"🤖 Welcome to @{current_bot_username}!\n\n"
-                "✅ Your email aliases have been migrated to this bot.\n\n"
+                "❓ I don't understand that command.\n\n"
                 "Available commands:\n"
+                "• /start - Get started with the bot\n"
+                "• /help - Show help information\n"
                 "• /list - Show your email aliases\n"
-                "• /register - Create a new alias\n"
+                "• /register - Create a new email alias\n"
                 "• /deactivate <alias> - Disable an alias\n\n"
-                "Send emails to your aliases to receive AI-summarized versions here!"
+                "Need help? Contact support."
             ),
-            parse_mode="Markdown",
+            parse_mode="Markdown"
+        )
+
+
+def _handle_start_command(bot_token: str, chat_id: int, username: str, first_name: str) -> None:
+    """Handle /start command."""
+    # Ensure user exists in database
+    _ensure_user_exists(chat_id, username, first_name)
+    
+    # Send welcome message
+    welcome_text = f"""👋 Welcome {first_name or username}!
+
+I'm your Email Summarizer bot. Here's what I can do:
+
+📧 **Receive Emails**
+• Create unique email aliases
+• Forward emails to your aliases
+• Get AI-powered summaries in Telegram
+
+🛠️ **Commands**
+• /list - Show your email aliases
+• /register - Create a new alias
+• /deactivate <alias> - Disable an alias
+• /help - Get help
+
+🚀 **Get Started**
+1. Use /register to create your first email alias
+2. Send emails to that address
+3. Receive AI-summarized versions here!
+
+Need help? Just ask!"""
+    
+    _send_telegram_message(bot_token, chat_id, welcome_text)
+
+
+def _handle_help_command(bot_token: str, chat_id: int) -> None:
+    """Handle /help command."""
+    help_text = """📚 **Help & Usage Guide**
+
+**How It Works**
+1. Create email aliases using /register
+2. Send emails to your alias addresses
+3. Receive AI-summarized versions in Telegram
+4. Download original emails when needed
+
+**Available Commands**
+• /start - Welcome message
+• /list - Show your email aliases
+• /register - Create new email alias
+• /deactivate <alias> - Disable an alias
+
+**Creating Aliases**
+Use /register to get a new email address like:
+  `abc123@{domain}`
+
+You can use this address anywhere! Emails sent to it will be:
+1. Securely stored
+2. Summarized by AI
+3. Sent to you in Telegram
+
+**Managing Aliases**
+• See all aliases: /list
+• Disable an alias: /deactivate abc123
+• Disabled aliases stop receiving emails
+
+**Privacy & Security**
+• Your emails are encrypted
+• Aliases can be disabled anytime
+• No permanent storage
+
+Need more help? Contact support."""
+    
+    help_text = help_text.replace("{domain}", EMAIL_DOMAIN)
+    
+    _send_telegram_message(bot_token, chat_id, help_text, parse_mode="Markdown")
+
+
+def _handle_list_command(bot_token: str, chat_id: int) -> None:
+    """Handle /list command - show user's email aliases."""
+    aliases_table = os.environ["ALIASES_TABLE"]
+    
+    # Get user's aliases from DynamoDB
+    aliases = _get_user_aliases(aliases_table, str(chat_id))
+    
+    if not aliases:
+        _send_telegram_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            text=(
+                "📭 You don't have any email aliases yet.\n\n"
+                "Use /register to create your first email alias!"
+            )
         )
         return
-
-    # ----- list / aliases -----
-    if lower.startswith("/list") or lower.startswith("/aliases"):
-        _send_alias_overview(cfg, token, chat_id, user_record)
-        return
-
-    # ----- register / newemail / create -----
-    if lower.startswith("/register") or lower.startswith("/newemail") or lower.startswith("/create"):
-        _create_alias_flow(cfg, token, chat_id, current_bot_id, current_bot_username)
-        return
-
-    # ----- deactivate / disable + argument -----
-    if lower.startswith("/deactivate") or lower.startswith("/disable"):
-        parts = text.split()
-        if len(parts) < 2:
-            telegram.send_message(
-                token,
-                chat_id=chat_id,
-                text="Usage: /deactivate <alias-id or full-email>\nExample: /deactivate abc123 or /deactivate abc123@domain.com",
-            )
-            return
-        alias_input = parts[1]
-        alias_id = _normalize_alias_input(alias_input)
-        _disable_alias_flow(cfg, token, chat_id, alias_id)
-        return
-
-    # Fallback help text
-    telegram.send_message(
-        token,
-        chat_id=chat_id,
-        text=(
-            "Available commands:\n"
-            "• /list – show your email aliases\n"
-            "• /register – create a new alias\n"
-            "• /deactivate <alias-id> – disable an alias\n\n"
-            "Need help? Just type /start to begin."
-        ),
-    )
-
-
-def _handle_callback_query(cfg: config.RuntimeConfig, token: str, payload: dict[str, Any]) -> None:
-    """
-    Handle button presses from inline keyboards.
-
-    We support callback data formats like:
-      - disable:abcd1234
-      - deactivate:abcd1234
-      - deactivate:abcd1234@your-domain.com
-    """
-    data = payload.get("data", "") or ""
-    chat_id = payload.get("message", {}).get("chat", {}).get("id")
-    message_id = payload.get("message", {}).get("message_id")
-
-    if chat_id and ":" in data:
-        action, value = data.split(":", 1)
-        if action in ("disable", "deactivate"):
-            alias_id = _normalize_alias_input(value)
-            _disable_alias_flow(cfg, token, chat_id, alias_id)
-
-    # Always answer the callback so Telegram stops the "loading" spinner
-    callback_id = payload.get("id")
-    if callback_id:
-        _telegram_api_post(token, "answerCallbackQuery", {"callback_query_id": callback_id})
-
-
-def _send_alias_overview(
-    cfg: config.RuntimeConfig,
-    token: str,
-    chat_id: int,
-    user_record: dict[str, Any] | None,
-) -> None:
-    """Send a message listing all aliases owned by this Telegram chat."""
-    aliases = _list_aliases(cfg, chat_id)
-
-    if aliases:
-        lines = []
-        if user_record and user_record.get("first_name"):
-            lines.append(f"Hi {user_record['first_name']}! 👋")
-        lines.append("Your current email aliases:")
+    
+    # Format aliases list
+    lines = ["📧 **Your Email Aliases**\n"]
+    
+    for alias in aliases:
+        alias_id = alias.get("alias_id", "unknown")
+        email_address = alias.get("email_address", f"{alias_id}@{EMAIL_DOMAIN}")
+        status = alias.get("status", "UNKNOWN")
         
-        for alias in aliases:
-            status = alias.get("status", "UNKNOWN")
-            email_address = alias.get("email_address") or f"{alias.get('alias_id')}@?"
-            
-            # Add emoji based on status
-            if status == "ACTIVE":
-                status_emoji = "✅"
-            elif status == "DISABLED":
-                status_emoji = "❌"
-            else:
-                status_emoji = "❓"
-            
-            lines.append(f"{status_emoji} `{email_address}` ({status})")
+        # Add emoji based on status
+        if status == "ACTIVE":
+            status_emoji = "✅"
+        elif status == "DISABLED":
+            status_emoji = "❌"
+        else:
+            status_emoji = "❓"
         
-        lines.append("\nUse /register to create a new alias.")
-        lines.append("Use /deactivate <alias-id> to disable one.")
-    else:
-        lines = [
-            "You have no aliases yet. 😔",
-            "Use /register to generate a new email address.",
-            "",
-            "Once created, you can:",
-            "• Send emails to your alias",
-            "• Receive AI-summarized versions here",
-            "• Download original emails when needed"
-        ]
-
-    telegram.send_message(token, chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown")
-
-
-def _create_alias_flow(
-    cfg: config.RuntimeConfig, 
-    token: str, 
-    chat_id: int,
-    bot_id: str,
-    bot_username: str
-) -> None:
-    """Generate a new Cloudflare alias + DynamoDB record for this Telegram user."""
-    if not cfg.aliases_table:
-        telegram.send_message(token, chat_id=chat_id, text="❌ Alias table not configured.")
-        return
-
-    try:
-        alias_record = _provision_alias(cfg, chat_id, bot_id, bot_username)
-    except Exception as exc:
-        logger.exception("Alias creation failed", extra={"chat_id": chat_id, "error": str(exc)})
-        telegram.send_message(token, chat_id=chat_id, text="❌ Could not create alias. Please try again later.")
-        return
-
-    telegram.send_message(
-        token,
+        lines.append(f"{status_emoji} `{email_address}`")
+        
+        # Add creation date if available
+        created_at = alias.get("created_at")
+        if created_at:
+            try:
+                dt_obj = dt.datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                date_str = dt_obj.strftime("%b %d, %Y")
+                lines.append(f"   Created: {date_str}")
+            except:
+                pass
+        
+        lines.append("")  # Empty line between aliases
+    
+    lines.append("\n💡 Use /deactivate <alias> to disable an alias.")
+    
+    _send_telegram_message(
+        bot_token=bot_token,
         chat_id=chat_id,
-        text=(
-            "🎉 New email alias created!\n\n"
-            f"**Address:** `{alias_record['email_address']}`\n\n"
-            "📧 **How to use:**\n"
-            "1. Send or forward emails to this address\n"
-            "2. Receive AI-summarized versions here\n"
-            "3. Download original emails when needed\n\n"
-            "⚙️ **Manage:** Use /deactivate to disable this alias."
-        ),
-        parse_mode="Markdown",
-    )
-
-
-def _disable_alias_flow(cfg: config.RuntimeConfig, token: str, chat_id: int, alias_id: str) -> None:
-    """
-    Disable an alias:
-
-    - checks that the alias belongs to this chat
-    - disables Cloudflare routing rule
-    - updates DynamoDB status = DISABLED
-    """
-    if not cfg.aliases_table:
-        telegram.send_message(token, chat_id=chat_id, text="❌ Alias table not configured.")
-        return
-
-    alias_record = dynamodb.get_item(cfg.aliases_table, {"alias_id": alias_id})
-    if not alias_record or alias_record.get("telegram_chat_id") != str(chat_id):
-        telegram.send_message(token, chat_id=chat_id, text="❌ Alias not found.")
-        return
-
-    if alias_record.get("status") == "DISABLED":
-        telegram.send_message(token, chat_id=chat_id, text="ℹ️ Alias is already disabled.")
-        return
-
-    # 1) Disable Cloudflare rule (catch-all routing for this alias)
-    rule_id = alias_record.get("cloudflare_rule_id")
-    if rule_id:
-        try:
-            cloudflare.disable_alias(cfg.cloudflare_secret_arn, rule_id)
-        except Exception as exc:
-            logger.warning(
-                "Failed to disable Cloudflare rule",
-                extra={"alias_id": alias_id, "error": str(exc)},
-            )
-
-    # 2) Update DynamoDB record
-    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
-    dynamodb.update_item(
-        cfg.aliases_table,
-        {"alias_id": alias_id},
-        UpdateExpression="SET #status = :status, disabled_at = :ts",
-        ExpressionAttributeNames={"#status": "status"},
-        ExpressionAttributeValues={":status": "DISABLED", ":ts": now_iso},
-    )
-
-    telegram.send_message(
-        token, 
-        chat_id=chat_id, 
-        text=f"✅ Alias `{alias_id}` has been disabled.", 
+        text="\n".join(lines),
         parse_mode="Markdown"
     )
 
 
-def _list_aliases(cfg: config.RuntimeConfig, chat_id: int) -> list[dict[str, Any]]:
-    """Query aliases owned by this Telegram chat ID."""
-    if not cfg.aliases_table:
-        return []
+def _handle_register_command(bot_token: str, chat_id: int) -> None:
+    """Handle /register command - create new email alias."""
+    aliases_table = os.environ["ALIASES_TABLE"]
+    cloudflare_secret_arn = os.environ["CLOUDFLARE_SECRET_ARN"]
     
-    try:
-        # Query using GSI on telegram_chat_id
-        table = _dynamodb.Table(cfg.aliases_table)
-        response = table.query(
-            IndexName="TelegramChatIndex",  # You need to create this GSI
-            KeyConditionExpression=boto3.dynamodb.conditions.Key("telegram_chat_id").eq(str(chat_id))
-        )
-        return response.get("Items", [])
-    except Exception:
-        # Fallback: scan (inefficient)
-        logger.warning("GSI query failed, falling back to scan")
-        response = table.scan(
-            FilterExpression="telegram_chat_id = :chat_id",
-            ExpressionAttributeValues={":chat_id": str(chat_id)}
-        )
-        return response.get("Items", [])
-
-
-def _ensure_user(
-    cfg: config.RuntimeConfig,
-    chat_id: int,
-    message: dict[str, Any],
-    bot_id: str,
-    bot_username: str,
-) -> dict[str, Any] | None:
-    """
-    Ensure we have a user record in the users table with current bot info.
-    """
-    if not cfg.users_table:
-        return None
-
-    chat_id_str = str(chat_id)
-    existing = dynamodb.get_item(cfg.users_table, {"telegram_chat_id": chat_id_str})
+    # Generate unique alias ID
+    alias_id = _generate_alias_id()
     
-    user_meta = message.get("from", {}) or {}
-    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
-
+    # Check for collisions (unlikely but possible)
+    existing = _get_alias_record(aliases_table, alias_id)
     if existing:
-        # Update existing user with current bot info and activity
-        item = {
-            "telegram_chat_id": chat_id_str,
-            "telegram_bot_id": bot_id,
-            "telegram_bot_username": bot_username,
-            "last_active_at": now_iso,
-            "username": user_meta.get("username") or existing.get("username"),
-            "first_name": user_meta.get("first_name") or existing.get("first_name"),
-            "last_name": user_meta.get("last_name") or existing.get("last_name"),
+        # Try one more time
+        alias_id = _generate_alias_id()
+        existing = _get_alias_record(aliases_table, alias_id)
+        if existing:
+            _send_telegram_message(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                text="❌ Could not generate unique alias. Please try again."
+            )
+            return
+    
+    # Create Cloudflare email routing rule
+    try:
+        # Import here to avoid dependency if not used
+        from shared import cloudflare
+        
+        # Create Cloudflare rule
+        cf_result = cloudflare.create_alias(cloudflare_secret_arn, alias_id)
+        
+        if not cf_result or "error" in cf_result:
+            logger.error(f"Failed to create Cloudflare rule: {cf_result}")
+            _send_telegram_message(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                text="❌ Failed to create email routing rule. Please try again later."
+            )
+            return
+        
+        # Extract email address from Cloudflare response
+        email_address = cf_result.get("name", f"{alias_id}@{EMAIL_DOMAIN}")
+        rule_id = cf_result.get("id", "")
+        
+    except Exception as exc:
+        logger.exception(f"Failed to create Cloudflare alias: {exc}")
+        _send_telegram_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            text="❌ Failed to configure email routing. Please try again later."
+        )
+        return
+    
+    # Save alias to DynamoDB
+    try:
+        table = _dynamodb.Table(aliases_table)
+        
+        alias_data = {
+            "alias_id": alias_id,
+            "email_address": email_address,
+            "telegram_chat_id": str(chat_id),
+            "cloudflare_rule_id": rule_id,
             "status": "ACTIVE",
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
         
-        # Only update if bot has changed or user info is missing
-        if (existing.get("telegram_bot_id") != bot_id or 
-            not existing.get("username") and user_meta.get("username")):
-            dynamodb.upsert_item(cfg.users_table, item)
+        table.put_item(Item=alias_data)
         
-        return existing
+        # Send success message
+        success_text = f"""🎉 **New Email Alias Created!**
+
+**Email Address:**
+`{email_address}`
+
+**How to use it:**
+1. Use this address anywhere you need an email
+2. Forward emails to this address
+3. Receive AI-summarized versions here
+
+**Features:**
+• AI-powered summaries
+• Secure email storage
+• One-click downloads
+• Easy to disable
+
+**To disable this alias:**
+Use `/deactivate {alias_id}`
+
+Start using your new email address right away! 📧"""
+        
+        _send_telegram_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            text=success_text,
+            parse_mode="Markdown"
+        )
+        
+        logger.info(f"Created new alias {alias_id} for chat {chat_id}")
+        
+    except Exception as exc:
+        logger.exception(f"Failed to save alias to DynamoDB: {exc}")
+        
+        # Try to clean up Cloudflare rule
+        try:
+            from shared import cloudflare
+            if rule_id:
+                cloudflare.disable_alias(cloudflare_secret_arn, rule_id)
+        except:
+            pass
+        
+        _send_telegram_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            text="❌ Failed to save alias. Please try again."
+        )
+
+
+def _handle_deactivate_command(bot_token: str, chat_id: int, text: str) -> None:
+    """Handle /deactivate command - disable an email alias."""
+    aliases_table = os.environ["ALIASES_TABLE"]
+    cloudflare_secret_arn = os.environ["CLOUDFLARE_SECRET_ARN"]
     
+    # Parse alias from command
+    parts = text.split()
+    if len(parts) < 2:
+        _send_telegram_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            text=(
+                "❓ Usage: /deactivate <alias>\n\n"
+                "Example:\n"
+                "• /deactivate abc123\n"
+                "• /deactivate abc123@domain.com"
+            )
+        )
+        return
+    
+    alias_input = parts[1].strip()
+    
+    # Extract alias ID (remove @domain if present)
+    if "@" in alias_input:
+        alias_id = alias_input.split("@")[0]
     else:
-        # Create new user
-        item = {
-            "telegram_chat_id": chat_id_str,
-            "telegram_bot_id": bot_id,
-            "telegram_bot_username": bot_username,
-            "username": user_meta.get("username"),
-            "first_name": user_meta.get("first_name"),
-            "last_name": user_meta.get("last_name"),
-            "locale": user_meta.get("language_code"),
-            "status": "ACTIVE",
-            "created_at": now_iso,
-            "last_active_at": now_iso,
-        }
-        dynamodb.upsert_item(cfg.users_table, item)
-        return item
-
-
-def _update_user_with_bot_info(
-    cfg: config.RuntimeConfig,
-    chat_id: int,
-    bot_id: str,
-    bot_username: str,
-    message: dict[str, Any]
-) -> None:
-    """Update user record with current bot information."""
-    chat_id_str = str(chat_id)
-    user_meta = message.get("from", {}) or {}
-    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
-
-    item = {
-        "telegram_chat_id": chat_id_str,
-        "telegram_bot_id": bot_id,
-        "telegram_bot_username": bot_username,
-        "last_active_at": now_iso,
-        "status": "ACTIVE",
-    }
-
-    # Add optional user info if available
-    if user_meta.get("username"):
-        item["username"] = user_meta["username"]
-    if user_meta.get("first_name"):
-        item["first_name"] = user_meta["first_name"]
-    if user_meta.get("last_name"):
-        item["last_name"] = user_meta["last_name"]
-    if user_meta.get("language_code"):
-        item["locale"] = user_meta["language_code"]
-
-    dynamodb.upsert_item(cfg.users_table, item)
-    logger.info(f"Updated user {chat_id_str} with bot @{bot_username}")
-
-
-def _migrate_user_aliases_to_bot(
-    cfg: config.RuntimeConfig,
-    chat_id_str: str,
-    new_bot_id: str,
-    new_bot_username: str
-) -> None:
-    """Migrate all user's aliases to new bot."""
-    aliases = _list_aliases(cfg, int(chat_id_str))
+        alias_id = alias_input
     
-    migrated_count = 0
-    for alias in aliases:
-        alias_id = alias.get("alias_id")
+    # Get alias record
+    alias_record = _get_alias_record(aliases_table, alias_id)
+    
+    if not alias_record:
+        _send_telegram_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            text=f"❌ Alias `{alias_id}` not found."
+        )
+        return
+    
+    # Check ownership
+    if alias_record.get("telegram_chat_id") != str(chat_id):
+        _send_telegram_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            text="❌ You don't own this alias."
+        )
+        return
+    
+    # Check if already disabled
+    if alias_record.get("status") == "DISABLED":
+        _send_telegram_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            text=f"ℹ️ Alias `{alias_id}` is already disabled."
+        )
+        return
+    
+    # Disable Cloudflare rule
+    rule_id = alias_record.get("cloudflare_rule_id")
+    if rule_id:
+        try:
+            from shared import cloudflare
+            cloudflare.disable_alias(cloudflare_secret_arn, rule_id)
+        except Exception as exc:
+            logger.error(f"Failed to disable Cloudflare rule: {exc}")
+            # Continue anyway, we'll still mark it as disabled in DB
+    
+    # Update alias status in DynamoDB
+    try:
+        table = _dynamodb.Table(aliases_table)
         
-        # Update alias with new bot info
-        dynamodb.update_item(
-            cfg.aliases_table,
-            {"alias_id": alias_id},
+        table.update_item(
+            Key={"alias_id": alias_id},
             UpdateExpression="""
-                SET telegram_bot_id = :bot_id,
-                    telegram_bot_username = :bot_username,
-                    bot_migrated_at = :now
+                SET #status = :status,
+                    disabled_at = :disabled_at
             """,
+            ExpressionAttributeNames={
+                "#status": "status"
+            },
             ExpressionAttributeValues={
-                ":bot_id": new_bot_id,
-                ":bot_username": new_bot_username,
-                ":now": dt.datetime.now(dt.timezone.utc).isoformat()
+                ":status": "DISABLED",
+                ":disabled_at": dt.datetime.now(dt.timezone.utc).isoformat()
             }
         )
         
-        # Migrate pending emails for this alias
-        migrated_emails = _migrate_pending_emails_for_alias(
-            cfg, alias_id, chat_id_str, new_bot_id, new_bot_username
+        email_address = alias_record.get("email_address", f"{alias_id}@{EMAIL_DOMAIN}")
+        
+        _send_telegram_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            text=(
+                f"✅ Alias disabled successfully!\n\n"
+                f"`{email_address}`\n\n"
+                f"This address will no longer receive emails.\n"
+                f"You can create a new one anytime with /register."
+            ),
+            parse_mode="Markdown"
         )
         
-        migrated_count += 1
-        logger.info(f"Migrated alias {alias_id} to bot @{new_bot_username} ({migrated_emails} emails)")
-    
-    if migrated_count > 0:
-        logger.info(f"✅ Migrated {migrated_count} aliases to new bot for user {chat_id_str}")
-
-
-def _migrate_pending_emails_for_alias(
-    cfg: config.RuntimeConfig,
-    alias_id: str,
-    chat_id_str: str,
-    new_bot_id: str,
-    new_bot_username: str
-) -> int:
-    """Migrate pending emails for an alias to new bot."""
-    table = _dynamodb.Table(cfg.emails_table)
-    
-    # Scan for pending emails for this alias
-    response = table.scan(
-        FilterExpression="alias_id = :alias AND #state = :state",
-        ExpressionAttributeNames={"#state": "state"},
-        ExpressionAttributeValues={
-            ":alias": alias_id,
-            ":state": "PENDING"
-        }
-    )
-    
-    migrated = 0
-    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
-    
-    for email_item in response.get('Items', []):
-        email_bot_id = email_item.get("telegram_bot_id")
+        logger.info(f"Disabled alias {alias_id} for chat {chat_id}")
         
-        # Only migrate if email is for different bot
-        if email_bot_id != new_bot_id:
-            table.update_item(
-                Key={'message_id': email_item['message_id']},
-                UpdateExpression="""
-                    SET telegram_chat_id = :chat_id,
-                        telegram_bot_id = :bot_id,
-                        telegram_bot_username = :bot_username,
-                        needs_migration = :false,
-                        migrated_at = :now
-                """,
-                ExpressionAttributeValues={
-                    ":chat_id": chat_id_str,
-                    ":bot_id": new_bot_id,
-                    ":bot_username": new_bot_username,
-                    ":false": False,
-                    ":now": now_iso
-                }
-            )
-            migrated += 1
+    except Exception as exc:
+        logger.exception(f"Failed to disable alias: {exc}")
+        _send_telegram_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            text="❌ Failed to disable alias. Please try again."
+        )
+
+
+def _handle_callback_query(bot_token: str, callback_query: Dict[str, Any]) -> None:
+    """Handle callback queries from inline keyboards."""
+    data = callback_query.get("data", "")
+    chat_id = callback_query.get("message", {}).get("chat", {}).get("id")
+    callback_id = callback_query.get("id", "")
     
-    return migrated
-
-
-def _provision_alias(
-    cfg: config.RuntimeConfig, 
-    chat_id: int, 
-    bot_id: str,
-    bot_username: str
-) -> dict[str, Any]:
-    """
-    Create a Cloudflare routing rule for a new alias and store its metadata.
-    """
-    alias_id = _generate_alias_id()
-
-    # Guard against collision (very unlikely, but safe)
-    existing = dynamodb.get_item(cfg.aliases_table, {"alias_id": alias_id})
-    if existing:
-        # Try again with different ID
-        return _provision_alias(cfg, chat_id, bot_id, bot_username)
-
-    # Ask Cloudflare to create a rule for this alias
-    cf_result = cloudflare.create_alias(cfg.cloudflare_secret_arn, alias_id)
-    email_address = cf_result.get("name")  # full email, e.g., abcd1234@domain.com
-    rule_id = cf_result.get("id")         # Cloudflare rule ID
-
-    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
-    record = {
-        "alias_id": alias_id,
-        "email_address": email_address,
-        "telegram_chat_id": str(chat_id),
-        "telegram_bot_id": bot_id,
-        "telegram_bot_username": bot_username,
-        "status": "ACTIVE",
-        "cloudflare_rule_id": rule_id,
-        "created_at": now_iso,
-    }
+    if not data or not chat_id or not callback_id:
+        return
     
-    dynamodb.upsert_item(cfg.aliases_table, record)
+    # Answer the callback query first (stops loading indicator)
+    _answer_callback_query(bot_token, callback_id)
     
-    # Also update user's last activity
-    _update_user_with_bot_info(cfg, chat_id, bot_id, bot_username, {"from": {}})
-    
-    return record
+    # Parse callback data (format: "action:value")
+    if ":" in data:
+        action, value = data.split(":", 1)
+        
+        if action == "disable":
+            # Handle disable button
+            aliases_table = os.environ["ALIASES_TABLE"]
+            alias_record = _get_alias_record(aliases_table, value)
+            
+            if alias_record and alias_record.get("telegram_chat_id") == str(chat_id):
+                # Send deactivation confirmation
+                _send_telegram_message(
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    text=(
+                        f"Are you sure you want to disable alias `{value}`?\n\n"
+                        f"Use /deactivate {value} to confirm."
+                    ),
+                    parse_mode="Markdown"
+                )
 
 
-def _generate_alias_id(length: int = 8) -> str:
-    """Short random identifier (used as email local-part)."""
-    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-    return "".join(secrets_lib.choice(alphabet) for _ in range(length))
-
-
-def _normalize_alias_input(value: str) -> str:
-    """
-    Convert user input into a clean alias_id.
-
-    Accepts:
-      - "abcd1234"                → "abcd1234"
-      - "abcd1234@domain.com"     → "abcd1234"
-    """
-    value = value.strip().lower()
-    if "@" in value:
-        value = value.split("@", 1)[0]
-    return value
-
-
-def _handle_email_download(cfg: config.RuntimeConfig, event: dict[str, Any]) -> dict[str, Any]:
-    """
-    Handle GET /email/{aliasId}/{messageId}.
-
-    This is used by the "Download Raw Email" link that Lambda #2 embeds in the
-    Telegram summary.
-    """
-    path_params = event.get("pathParameters") or {}
+def _handle_email_download(event: dict[str, Any]) -> dict[str, Any]:
+    """Handle email download redirects."""
+    path_params = event.get("pathParameters", {})
     alias_id = path_params.get("aliasId")
     message_id = path_params.get("messageId")
-
-    if not alias_id or not message_id:
-        return {"statusCode": 400, "body": "Missing aliasId or messageId"}
-
-    if not cfg.emails_table:
-        return {"statusCode": 500, "body": "Emails table not configured"}
-
-    # Load email record
-    record = dynamodb.get_item(cfg.emails_table, {"message_id": message_id})
-    if not record or record.get("alias_id") != alias_id:
-        return {"statusCode": 404, "body": "Not Found"}
-
-    key = record.get("s3_key")
-    if not key:
-        return {"statusCode": 500, "body": "Missing S3 key for email"}
-
-    # Build pre-signed URL (expiration is handled by shared.s3_utils)
-    url = s3_utils.generate_presigned_url(cfg.raw_email_bucket, key)
-
-    return {
-        "statusCode": 302,
-        "headers": {"Location": url},
-        "body": "",
-    }
-
-
-def _telegram_api_post(token: str, method: str, payload: dict[str, Any]) -> None:
-    """
-    Call Telegram Bot API using only the Python standard library.
-    """
-    url = f"{TELEGRAM_API_BASE}/bot{token}/{method}"
-    data = json.dumps(payload).encode("utf-8")
-    req = urlrequest.Request(
-        url, 
-        data=data, 
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
     
+    if not alias_id or not message_id:
+        return {
+            "statusCode": 400,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "Missing aliasId or messageId"})
+        }
+    
+    emails_table = os.environ["EMAILS_TABLE"]
+    raw_email_bucket = os.environ["RAW_EMAIL_BUCKET"]
+    
+    # Get email record
+    email_record = _get_email_record(emails_table, message_id)
+    
+    if not email_record or email_record.get("alias_id") != alias_id:
+        return {
+            "statusCode": 404,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "Email not found"})
+        }
+    
+    s3_key = email_record.get("s3_key")
+    if not s3_key:
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "Missing S3 key"})
+        }
+    
+    # Generate pre-signed URL for S3 object (valid for 5 minutes)
     try:
-        with urlrequest.urlopen(req, timeout=10) as resp:
-            resp.read()  # Read to complete request
-    except Exception as exc:
-        logger.warning(
-            "Telegram API call failed",
-            extra={"method": method, "error": str(exc)},
+        url = _s3.generate_presigned_url(
+            ClientMethod='get_object',
+            Params={
+                'Bucket': raw_email_bucket,
+                'Key': s3_key
+            },
+            ExpiresIn=300  # 5 minutes
         )
+        
+        # Redirect to the pre-signed URL
+        return {
+            "statusCode": 302,
+            "headers": {"Location": url},
+            "body": ""
+        }
+        
+    except Exception as exc:
+        logger.error(f"Failed to generate pre-signed URL: {exc}")
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "Failed to generate download link"})
+        }
 
 
-# Helper function to check if user exists (for backward compatibility)
-def _get_user(cfg: config.RuntimeConfig, chat_id: int) -> dict[str, Any] | None:
-    """Get user record by chat_id."""
-    if not cfg.users_table:
-        return None
-    return dynamodb.get_item(cfg.users_table, {"telegram_chat_id": str(chat_id)})
-
-
-# Optional: Health check endpoint
 def _handle_health_check() -> dict[str, Any]:
     """Handle health check requests."""
     return {
         "statusCode": 200,
         "headers": {"Content-Type": "application/json"},
         "body": json.dumps({
-            "status": "ok",
+            "status": "healthy",
             "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
             "service": "telegram-webhook"
         })
     }
+
+
+# Helper functions
+
+def _get_telegram_token(secret_arn: str) -> Optional[str]:
+    """Get Telegram bot token from Secrets Manager."""
+    try:
+        response = _secrets.get_secret_value(SecretId=secret_arn)
+        secret_str = response.get("SecretString", "{}")
+        
+        # Try to parse as JSON
+        try:
+            data = json.loads(secret_str)
+            token = data.get("bot_token", "")
+        except json.JSONDecodeError:
+            # Assume the entire string is the token
+            token = secret_str
+        
+        return token.strip() if token else None
+        
+    except Exception as exc:
+        logger.error(f"Failed to get Telegram token: {exc}")
+        return None
+
+
+def _send_telegram_message(
+    bot_token: str,
+    chat_id: int,
+    text: str,
+    parse_mode: Optional[str] = None,
+    reply_markup: Optional[Dict] = None
+) -> bool:
+    """Send message to Telegram."""
+    try:
+        url = f"{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage"
+        
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True
+        }
+        
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        
+        data = json.dumps(payload).encode("utf-8")
+        req = request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        
+        with request.urlopen(req, timeout=10) as resp:
+            resp.read()  # Read response to complete request
+        
+        return True
+        
+    except Exception as exc:
+        logger.error(f"Failed to send Telegram message: {exc}")
+        return False
+
+
+def _answer_callback_query(bot_token: str, callback_id: str) -> None:
+    """Answer a callback query (stops loading indicator)."""
+    try:
+        url = f"{TELEGRAM_API_BASE}/bot{bot_token}/answerCallbackQuery"
+        
+        payload = {
+            "callback_query_id": callback_id
+        }
+        
+        data = json.dumps(payload).encode("utf-8")
+        req = request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        
+        with request.urlopen(req, timeout=5) as resp:
+            resp.read()
+            
+    except Exception as exc:
+        logger.error(f"Failed to answer callback query: {exc}")
+
+
+def _ensure_user_exists(chat_id: int, username: str, first_name: str) -> None:
+    """Ensure user exists in users table."""
+    try:
+        users_table = os.environ.get("USERS_TABLE")
+        if not users_table:
+            return
+        
+        table = _dynamodb.Table(users_table)
+        
+        # Check if user exists
+        response = table.get_item(Key={"telegram_chat_id": str(chat_id)})
+        
+        if "Item" not in response:
+            # Create new user
+            user_data = {
+                "telegram_chat_id": str(chat_id),
+                "username": username or "",
+                "first_name": first_name or "",
+                "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "last_active_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "status": "ACTIVE"
+            }
+            
+            table.put_item(Item=user_data)
+            logger.info(f"Created new user: {chat_id} ({username})")
+        else:
+            # Update last active timestamp
+            table.update_item(
+                Key={"telegram_chat_id": str(chat_id)},
+                UpdateExpression="SET last_active_at = :last_active",
+                ExpressionAttributeValues={
+                    ":last_active": dt.datetime.now(dt.timezone.utc).isoformat()
+                }
+            )
+            
+    except Exception as exc:
+        logger.error(f"Failed to ensure user exists: {exc}")
+
+
+def _get_user_aliases(aliases_table: str, chat_id: str) -> List[Dict[str, Any]]:
+    """Get all aliases for a user."""
+    try:
+        table = _dynamodb.Table(aliases_table)
+        
+        # Scan for user's aliases (using filter)
+        response = table.scan(
+            FilterExpression="telegram_chat_id = :chat_id",
+            ExpressionAttributeValues={":chat_id": chat_id}
+        )
+        
+        return response.get("Items", [])
+        
+    except Exception as exc:
+        logger.error(f"Failed to get user aliases: {exc}")
+        return []
+
+
+def _get_alias_record(aliases_table: str, alias_id: str) -> Optional[Dict[str, Any]]:
+    """Get alias record by ID."""
+    try:
+        table = _dynamodb.Table(aliases_table)
+        response = table.get_item(Key={"alias_id": alias_id})
+        return response.get("Item")
+    except Exception as exc:
+        logger.error(f"Failed to get alias record: {exc}")
+        return None
+
+
+def _get_email_record(emails_table: str, message_id: str) -> Optional[Dict[str, Any]]:
+    """Get email record by message ID."""
+    try:
+        table = _dynamodb.Table(emails_table)
+        response = table.get_item(Key={"message_id": message_id})
+        return response.get("Item")
+    except Exception as exc:
+        logger.error(f"Failed to get email record: {exc}")
+        return None
+
+
+def _generate_alias_id(length: int = 8) -> str:
+    """Generate random alias ID."""
+    # Use lowercase letters and numbers
+    alphabet = string.ascii_lowercase + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
