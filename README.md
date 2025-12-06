@@ -1,11 +1,11 @@
 # IS - 238 Final Project
 
-Project Overview
+## Project Overview
 
 This repository contains the Telegram Email Summarizer MVP that was developed as a IS238 project.
 A Telegram bot is used so that users can receive summaries of incoming emails directly in a chat, together with a link to the raw .eml file and controls to deactivate their email address.
 
-Architecture
+## Architecture
 
 The system is designed as a pipeline on AWS:
 
@@ -31,7 +31,7 @@ Provides buttons to disable the email address and a pre-signed S3 URL to downloa
 
 All secrets (Telegram bot token, Gmail credentials, OpenAI key, Cloudflare data) are stored in AWS Secrets Manager and are loaded at runtime.
 
-Key Features
+## Key Features
 
 Dynamic aliases
 A registration flow is used so that a random email address under the project domain is assigned to a Telegram user. This address is stored with a unique chat_id in DynamoDB.
@@ -39,7 +39,7 @@ A registration flow is used so that a random email address under the project dom
 Automatic summarization
 For each new email, a short summary is requested from an OpenAI-compatible endpoint. If the API is unavailable, a fallback summary (truncated body) is generated so the pipeline remains robust.
 
-Telegram notifications
+## Telegram notifications
 For each processed email, a Telegram message is sent that includes:
 
 Subject and summary
@@ -51,7 +51,7 @@ Inline buttons to disable the address and to access the download link
 Address deactivation
 When the user taps “Disable this address”, a callback query is handled and the address is marked as DISABLED in DynamoDB, so further summaries are no longer sent.
 
-Technology Stack
+## Technology Stack
 
 AWS: Lambda, S3, DynamoDB, Secrets Manager, EventBridge
 
@@ -63,7 +63,7 @@ AI Summarization: OpenAI-compatible chat completions endpoint
 
 Language: Python 3.11
 
-How the Flow Works (Step by Step)
+## Flow
 
 A user registers with the Telegram bot and is assigned a unique email alias.
 
