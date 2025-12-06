@@ -1,0 +1,40 @@
+import json
+import boto3
+
+def lambda_handler(event, context):
+    # TODO implement
+    
+    bucket_name = 'emails-received-and-stored'  
+    sample_json = {"subject": "Let's go meow!", "body": "Let's get physical"} # to still be changed by the one from email
+    json_data = json.dumps(sample_json)
+    counter_key = 'email_counter.txt'
+    
+    s3 = boto3.client('s3')
+
+    response = s3.get_object(Bucket=bucket_name, Key=counter_key)
+
+    file_content = response['Body'].read().decode('utf-8') # Decode for text files
+    counter = float(file_content)
+    counter += 1
+    counter = str(counter)
+
+    s3.put_object(Bucket=bucket_name, Key=counter_key, Body=counter)
+
+    file_key = f'received-email{file_content}.json'
+
+    try:
+        # Upload the JSON string to S3
+        s3.put_object(Bucket=bucket_name, Key=file_key, Body=json_data, ContentType='application/json')
+        print(f"Successfully uploaded {file_key} to {bucket_name}")
+        return {
+            'statusCode': 200,
+            'body': json.dumps('JSON file uploaded successfully!')
+        }
+    except Exception as e:
+        print(f"Error uploading file to S3: {e}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f'Error uploading JSON file: {str(e)}')
+
+#   This was the initial lambda 1 code that was used for testing functionalities. First outside AWS (PyCharm) and was mounted on AWS Lambda
+# Tests were conducted if the email will be retreived and stored in S3 Bucket
